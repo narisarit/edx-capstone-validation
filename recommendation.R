@@ -1,0 +1,245 @@
+# recommendation.R - Final Version Matching Rubric for MovieLens Project
+
+# ------------------------
+# 📦 Load Required Libraries
+# ------------------------
+if (!require(tidyverse)) install.packages("tidyverse")
+if (!require(caret)) install.packages("caret")
+if (!require(recosystem)) install.packages("recosystem")
+if (!require(lubridate)) install.packages("lubridate")
+if (!require(future.apply)) install.packages("future.apply")
+
+library(tidyverse)
+library(caret)
+library(recosystem)
+library(lubridate)
+library(future.apply)
+
+# ------------------------
+# 📥 Data Loading & Preprocessing (DO NOT MODIFY)
+# ------------------------
+# Download and extract the dataset
+# Provided by the course and should not be modified
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+options(timeout = 120)
+
+dl <- "ml-10M100K.zip"
+if(!file.exists(dl))
+  download.file("https://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings_file <- "ml-10M100K/ratings.dat"
+if(!file.exists(ratings_file))
+  unzip(dl, ratings_file)
+
+movies_file <- "ml-10M100K/movies.dat"
+if(!file.exists(movies_file))
+  unzip(dl, movies_file)
+
+ratings <- as.data.frame(str_split(read_lines(ratings_file), fixed("::"), simplify = TRUE),
+                         stringsAsFactors = FALSE)
+colnames(ratings) <- c("userId", "movieId", "rating", "timestamp")
+ratings <- ratings %>%
+  mutate(userId = as.integer(userId),
+         movieId = as.integer(movieId),
+         rating = as.numeric(rating),
+         timestamp = as.integer(timestamp))
+
+movies <- as.data.frame(str_split(read_lines(movies_file), fixed("::"), simplify = TRUE),
+                        stringsAsFactors = FALSE)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- movies %>%
+  mutate(movieId = as.integer(movieId))
+
+# Merge datasets
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Create edx and final_holdout_test sets (as per instructions)
+set.seed(1, sample.kind="Rounding")
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+final_holdout_test <- temp %>%
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+
+removed <- anti_join(temp, final_holdout_test)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+
+# ------------------------
+# 📊 EDA with Correlation Analysis
+# ------------------------
+# Convert UNIX timestamp to POSIXct date format for time-based analysis
+edx <- edx %>% mutate(rating_date = as_datetime(timestamp))
+
+# Summary statistics for overall understanding of dataset
+summary(edx)
+cat("Number of unique users:", n_distinct(edx$userId), "
+")
+cat("Number of unique movies:", n_distinct(edx$movieId), "
+")
+
+# Distribution of ratings (e.g., is it left-skewed? Right-skewed?)
+edx %>% ggplot(aes(x = rating)) +
+  geom_bar() +
+  labs(title = "Distribution of Ratings", x = "Rating", y = "Frequency")
+
+# Number of ratings per user to identify active vs. infrequent users
+edx %>% count(userId) %>%
+  ggplot(aes(n)) +
+  geom_histogram(bins = 50) +
+  scale_x_log10() +
+  labs(title = "Ratings per User (log scale)", x = "Ratings per User", y = "Number of Users")
+
+# Number of ratings per movie to identify popular vs. obscure movies
+edx %>% count(movieId) %>%
+  ggplot(aes(n)) +
+  geom_histogram(bins = 50) +
+  scale_x_log10() +
+  labs(title = "Ratings per Movie (log scale)", x = "Ratings per Movie", y = "Number of Movies")
+
+# Top 15 most frequently rated genres
+edx %>%
+  separate_rows(genres, sep = "\\|") %>%
+  count(genres, sort = TRUE) %>%
+  top_n(15) %>%
+  ggplot(aes(x = reorder(genres, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Top Genres by Rating Count", x = "Genre", y = "Number of Ratings")
+
+# Rating frequency over time (to examine time-based trends)
+edx %>% ggplot(aes(rating_date)) +
+  geom_histogram(bins = 30) +
+  labs(title = "Ratings Over Time", x = "Date", y = "Number of Ratings")
+
+# Numeric correlation between timestamp and rating
+cor(as.numeric(edx$timestamp), edx$rating, use = "complete.obs")
+
+# Correlation between average user rating and individual ratings
+user_avg <- edx %>% group_by(userId) %>% summarize(user_mean = mean(rating), user_count = n())
+edx_user <- edx %>% left_join(user_avg, by = "userId")
+cor(edx_user$user_mean, edx_user$rating)
+
+# Correlation between average movie rating and individual ratings
+movie_avg <- edx %>% group_by(movieId) %>% summarize(movie_mean = mean(rating), movie_count = n())
+edx_movie <- edx %>% left_join(movie_avg, by = "movieId")
+cor(edx_movie$movie_mean, edx_movie$rating)
+
+# ------------------------
+# ✂️ Split edx into Train/Test for modeling
+# ------------------------
+split_by_user <- function(user_df, p = 0.8) {
+  n <- nrow(user_df)
+  if (n == 1) {
+    list(train = user_df, test = NULL)
+  } else {
+    idx <- createDataPartition(1:n, p = p, list = FALSE)
+    list(train = user_df[idx, ], test = user_df[-idx, ])
+  }
+}
+
+splits <- edx %>% group_by(userId) %>% group_split() %>% map(split_by_user)
+edx_train <- map_dfr(splits, "train")
+edx_test <- map_dfr(splits, "test") %>% filter(!is.null(.))
+
+edx_test <- edx_test %>% filter(movieId %in% edx_train$movieId, userId %in% edx_train$userId)
+
+# ------------------------
+# 🧠 Modeling
+# ------------------------
+
+mu <- mean(edx_train$rating)  # Global average
+
+# Naive Model
+rmse_baseline <- RMSE(edx_test$rating, mu)
+print(rmse_baseline)
+
+# Movie Effect Model
+b_i <- edx_train %>% group_by(movieId) %>% summarize(b_i = mean(rating - mu))
+pred_movie <- edx_test %>% left_join(b_i, by = "movieId") %>% mutate(pred = mu + b_i)
+rmse_movie <- RMSE(pred_movie$rating, pred_movie$pred)
+print(rmse_movie)
+
+# Movie + User Effect Model
+b_u <- edx_train %>% left_join(b_i, by = "movieId") %>% group_by(userId) %>% summarize(b_u = mean(rating - mu - b_i))
+pred_user_movie <- edx_test %>% left_join(b_i, by = "movieId") %>% left_join(b_u, by = "userId") %>% mutate(pred = mu + b_i + b_u)
+rmse_user_movie <- RMSE(pred_user_movie$rating, pred_user_movie$pred)
+print(rmse_user_movie)
+
+# Regularized Model
+lambdas <- seq(0, 10, 0.25)
+# Increase limit for large objects used in parallel processing
+options(future.globals.maxSize = 2 * 1024^3)
+plan(multisession, workers = parallel::detectCores() - 1)
+rmse_results <- future_sapply(lambdas, function(lambda) {
+  b_i <- edx_train %>% group_by(movieId) %>% summarize(b_i = sum(rating - mu)/(n() + lambda))
+  b_u <- edx_train %>% left_join(b_i, by = "movieId") %>% group_by(userId) %>% summarize(b_u = sum(rating - mu - b_i)/(n() + lambda))
+  pred <- edx_test %>% left_join(b_i, by = "movieId") %>% left_join(b_u, by = "userId") %>% mutate(pred = mu + b_i + b_u) %>% pull(pred)
+  RMSE(edx_test$rating, pred)
+})
+plan(sequential)
+best_lambda <- lambdas[which.min(rmse_results)]
+print(best_lambda)
+
+b_i <- edx_train %>% group_by(movieId) %>% summarize(b_i = sum(rating - mu)/(n() + best_lambda))
+b_u <- edx_train %>% left_join(b_i, by = "movieId") %>% group_by(userId) %>% summarize(b_u = sum(rating - mu - b_i)/(n() + best_lambda))
+pred_reg <- edx_test %>% left_join(b_i, by = "movieId") %>% left_join(b_u, by = "userId") %>% mutate(pred = mu + b_i + b_u)
+rmse_regularized <- RMSE(pred_reg$rating, pred_reg$pred)
+print(rmse_regularized)
+
+# Manual + MF Residual (Hybrid Model)
+edx_train_resid <- edx_train %>% left_join(b_i, by = "movieId") %>% left_join(b_u, by = "userId") %>% mutate(resid = rating - mu - b_i - b_u)
+train_resid <- data_memory(user_index = edx_train_resid$userId, item_index = edx_train_resid$movieId, rating = edx_train_resid$resid)
+
+r_hybrid <- Reco()
+opts_hybrid <- r_hybrid$tune(train_resid, opts = list(dim = c(10, 20, 30), costp_l2 = c(0.01, 0.1), costq_l2 = c(0.01, 0.1), niter = 10))
+r_hybrid$train(train_resid, opts = c(opts_hybrid$min, niter = 20))
+
+test_mf_hybrid <- data_memory(user_index = edx_test$userId, item_index = edx_test$movieId)
+pred_resid <- r_hybrid$predict(test_mf_hybrid, out_memory())
+pred_hybrid <- edx_test %>% left_join(b_i, by = "movieId") %>% left_join(b_u, by = "userId") %>% mutate(pred = mu + b_i + b_u + pred_resid)
+rmse_hybrid <- RMSE(pred_hybrid$rating, pred_hybrid$pred)
+print(rmse_hybrid)
+
+# Pure MF Model
+train_data <- data_memory(user_index = edx_train$userId, item_index = edx_train$movieId, rating = edx_train$rating)
+test_data <- data_memory(user_index = edx_test$userId, item_index = edx_test$movieId)
+
+r_mf <- Reco()
+opts_mf <- r_mf$tune(train_data, opts = list(dim = c(10, 20, 30), costp_l2 = c(0.01, 0.1), costq_l2 = c(0.01, 0.1), niter = 10, nthread = 2))
+r_mf$train(train_data, opts = c(opts_mf$min, niter = 20))
+
+pred_mf <- r_mf$predict(test_data, out_memory())
+rmse_mf <- RMSE(edx_test$rating, pred_mf)
+print(rmse_mf)
+
+# Compare all RMSEs
+rmse_df <- data.frame(
+  Model = c("Naive", "Movie Effect", "Movie + User", "Regularized", "Manual + MF", "Pure MF"),
+  RMSE = c(rmse_baseline, rmse_movie, rmse_user_movie, rmse_regularized, rmse_hybrid, rmse_mf)
+)
+
+print(rmse_df)
+
+ggplot(rmse_df, aes(x = reorder(Model, RMSE), y = RMSE)) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = round(RMSE, 4)), vjust = -0.3) +
+  labs(title = "RMSE Comparison by Model", x = "Model", y = "RMSE") +
+  theme_minimal()
+
+# Retrain Pure MF Model on full edx and testout on final_holdout_test
+train_data_final <- data_memory(user_index = edx$userId, item_index = edx$movieId, rating = edx$rating)
+r_final <- Reco()
+opts_final <- r_final$tune(train_data_final, opts = list(dim = c(10, 20, 30), costp_l2 = c(0.01, 0.1), costq_l2 = c(0.01, 0.1), niter = 10, nthread = 2))
+r_final$train(train_data_final, opts = c(opts_final$min, niter = 20))
+
+final_data <- data_memory(user_index = final_holdout_test$userId, item_index = final_holdout_test$movieId)
+pred_final <- r_final$predict(final_data, out_memory())
+rmse_final <- RMSE(final_holdout_test$rating, pred_final)
+print(paste("Final RMSE on final_holdout_test:", round(rmse_final, 5)))
